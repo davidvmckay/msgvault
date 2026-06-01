@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,8 +17,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/wesm/msgvault/internal/mime"
-	"github.com/wesm/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 // errLimitReached signals that ImportOptions.Limit tripped mid-thread so
@@ -94,7 +95,7 @@ func ImportDYI(ctx context.Context, st *store.Store, opts ImportOptions) (*Impor
 	summary := &ImportSummary{}
 	logger := opts.Logger
 	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		logger = slog.New(slog.DiscardHandler)
 	}
 	if opts.CheckpointEvery <= 0 {
 		opts.CheckpointEvery = 200
@@ -104,7 +105,7 @@ func ImportDYI(ctx context.Context, st *store.Store, opts ImportOptions) (*Impor
 		format = "auto"
 	}
 	switch format {
-	case "auto", "json", "html", "both":
+	case "auto", formatJSON, "html", "both":
 		// valid
 	default:
 		return nil, fmt.Errorf("fbmessenger: unknown --format %q (valid: auto, json, html, both)", format)
@@ -112,7 +113,7 @@ func ImportDYI(ctx context.Context, st *store.Store, opts ImportOptions) (*Impor
 
 	// Validate --me.
 	if opts.Me == "" {
-		return nil, fmt.Errorf("fbmessenger: --me is required")
+		return nil, errors.New("fbmessenger: --me is required")
 	}
 	if !strings.HasSuffix(opts.Me, "@"+Domain) {
 		return nil, fmt.Errorf("fbmessenger: --me must be a <slug>@%s address, got %q", Domain, opts.Me)
@@ -150,12 +151,12 @@ func ImportDYI(ctx context.Context, st *store.Store, opts ImportOptions) (*Impor
 		// then fall back to the latest checkpointed run (which includes
 		// failed/interrupted runs whose checkpoint is still valid).
 		prev, err := st.GetActiveSync(source.ID)
-		if err != nil {
+		if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
 			return nil, fmt.Errorf("fbmessenger: check active sync: %w", err)
 		}
 		if prev == nil || !prev.CursorBefore.Valid || prev.CursorBefore.String == "" {
 			prev, err = st.GetLatestCheckpointedSync(source.ID)
-			if err != nil {
+			if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
 				return nil, fmt.Errorf("fbmessenger: check checkpointed sync: %w", err)
 			}
 		}
@@ -262,13 +263,13 @@ func ImportDYI(ctx context.Context, st *store.Store, opts ImportOptions) (*Impor
 		// E2EE threads bypass the format filter entirely.
 		if effective != "e2ee_json" {
 			switch format {
-			case "json":
+			case formatJSON:
 				if effective == "html" {
 					continue
 				}
-				effective = "json"
+				effective = formatJSON
 			case "html":
-				if effective == "json" {
+				if effective == formatJSON {
 					continue
 				}
 				effective = "html"
@@ -276,7 +277,7 @@ func ImportDYI(ctx context.Context, st *store.Store, opts ImportOptions) (*Impor
 				// Keep as-is; "both" threads get both parsed.
 			case "auto":
 				if effective == "both" {
-					effective = "json"
+					effective = formatJSON
 				}
 			}
 		}
@@ -429,7 +430,7 @@ func importThread(
 		if err := runHTML("html_"); err != nil {
 			return err
 		}
-	case effective == "json":
+	case effective == formatJSON:
 		if err := runJSON(""); err != nil {
 			return err
 		}
@@ -568,7 +569,7 @@ func writeThreadToStore(
 			// display_name; falling back to what we wrote on the prior
 			// import preserves the sender label for self-authored rows.
 			err := st.DB().QueryRow(
-				`SELECT m.sender_id, m.is_from_me,
+				st.Rebind(`SELECT m.sender_id, m.is_from_me,
 					COALESCE(NULLIF(p.display_name, ''),
 						(SELECT mr.display_name FROM message_recipients mr
 						 WHERE mr.message_id = m.id AND mr.recipient_type = 'from'
@@ -576,7 +577,7 @@ func writeThreadToStore(
 					p.email_address
 				 FROM messages m
 				 LEFT JOIN participants p ON p.id = m.sender_id
-				 WHERE m.source_id = ? AND m.source_message_id = ?`,
+				 WHERE m.source_id = ? AND m.source_message_id = ?`),
 				sourceID, srcMsgID,
 			).Scan(&priorID, &priorIsFromMe, &priorName, &priorEmail)
 			if err == nil && priorID.Valid {
@@ -827,7 +828,7 @@ func handleAttachment(att Attachment, attachmentsDir string) (string, string, in
 	if _, err := io.Copy(h, f); err != nil {
 		return "", "", 0
 	}
-	contentHash := fmt.Sprintf("%x", h.Sum(nil))
+	contentHash := hex.EncodeToString(h.Sum(nil))
 	rel := filepath.Join(contentHash[:2], contentHash)
 	absStorage := filepath.Join(attachmentsDir, rel)
 

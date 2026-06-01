@@ -15,16 +15,16 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/wesm/msgvault/internal/config"
-	"github.com/wesm/msgvault/internal/fileutil"
-	"github.com/wesm/msgvault/internal/mime"
-	"github.com/wesm/msgvault/internal/query"
-	"github.com/wesm/msgvault/internal/remote"
-	"github.com/wesm/msgvault/internal/scheduler"
-	"github.com/wesm/msgvault/internal/search"
-	"github.com/wesm/msgvault/internal/store"
-	"github.com/wesm/msgvault/internal/vector"
-	"github.com/wesm/msgvault/internal/vector/hybrid"
+	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/fileutil"
+	"go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/remote"
+	"go.kenn.io/msgvault/internal/scheduler"
+	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/vector"
+	"go.kenn.io/msgvault/internal/vector/hybrid"
 	"golang.org/x/oauth2"
 )
 
@@ -77,6 +77,7 @@ type MessageSummary struct {
 	ID             int64    `json:"id"`
 	ConversationID int64    `json:"conversation_id,omitempty"`
 	Subject        string   `json:"subject"`
+	MessageType    string   `json:"message_type,omitempty"`
 	From           string   `json:"from"`
 	To             []string `json:"to"`
 	Cc             []string `json:"cc,omitempty"`
@@ -92,6 +93,7 @@ type MessageSummary struct {
 // MessageDetail represents a full message response.
 type MessageDetail struct {
 	MessageSummary
+
 	Body        string           `json:"body"`
 	BodyHTML    string           `json:"body_html,omitempty"`
 	Attachments []AttachmentInfo `json:"attachments"`
@@ -144,6 +146,7 @@ type generationSummary struct {
 // explain=1 was requested.
 type hybridSearchItem struct {
 	MessageSummary
+
 	Score *scoreBreakdown `json:"score,omitempty"`
 }
 
@@ -160,10 +163,13 @@ type scoreBreakdown struct {
 }
 
 // writeJSON writes a JSON response.
-func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
+	// Headers already sent; if Encode fails mid-stream (broken pipe,
+	// non-serializable value) there's no meaningful recovery beyond
+	// truncating the response body.
+	_ = json.NewEncoder(w).Encode(data) //nolint:errchkjson // any is the public API; mid-response error is unrecoverable
 }
 
 // writeError writes an error response.
@@ -177,11 +183,7 @@ func writeError(w http.ResponseWriter, status int, err string, message string) {
 func messageDetailFromQuery(qMsg *query.MessageDetail) MessageDetail {
 	from := ""
 	if len(qMsg.From) > 0 {
-		if qMsg.From[0].Name != "" {
-			from = fmt.Sprintf("%s <%s>", qMsg.From[0].Name, qMsg.From[0].Email)
-		} else {
-			from = qMsg.From[0].Email
-		}
+		from = formatQueryAddress(qMsg.From[0])
 	}
 
 	toAddrs := make([]string, 0, len(qMsg.To))
@@ -221,6 +223,7 @@ func messageDetailFromQuery(qMsg *query.MessageDetail) MessageDetail {
 			ID:             qMsg.ID,
 			ConversationID: qMsg.ConversationID,
 			Subject:        qMsg.Subject,
+			MessageType:    qMsg.MessageType,
 			From:           from,
 			To:             toAddrs,
 			Cc:             ccAddrs,
@@ -252,6 +255,7 @@ func toMessageSummary(m APIMessage) MessageSummary {
 		ID:             m.ID,
 		ConversationID: m.ConversationID,
 		Subject:        m.Subject,
+		MessageType:    m.MessageType,
 		From:           m.From,
 		To:             to,
 		Cc:             m.Cc,
@@ -329,7 +333,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		summaries[i] = toMessageSummary(m)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"total":     total,
 		"page":      page,
 		"page_size": pageSize,
@@ -373,13 +377,13 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	msg, err := s.store.GetMessage(id)
+	if errors.Is(err, store.ErrMessageNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "Message not found")
+		return
+	}
 	if err != nil {
 		s.logger.Error("failed to get message", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve message")
-		return
-	}
-	if msg == nil {
-		writeError(w, http.StatusNotFound, "not_found", "Message not found")
 		return
 	}
 
@@ -542,7 +546,7 @@ func (s *Server) handleHybridSearch(
 				"vector search is not configured")
 		case errors.Is(err, vector.ErrIndexStale):
 			writeError(w, http.StatusServiceUnavailable, "index_stale",
-				"the vector index does not match the configured model; run `msgvault build-embeddings --full-rebuild`")
+				"the vector index does not match the configured model; run `msgvault embeddings build --full-rebuild`")
 		case errors.Is(err, vector.ErrIndexBuilding):
 			writeError(w, http.StatusServiceUnavailable, "index_building",
 				"the initial vector index is still being built")
@@ -674,7 +678,7 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 		accounts = []AccountInfo{}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts": accounts,
 	})
 }
@@ -732,13 +736,14 @@ func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
 // tokenFile represents the on-disk token format (matches oauth package).
 type tokenFile struct {
 	oauth2.Token
+
 	Scopes   []string `json:"scopes,omitempty"`
 	TenantID string   `json:"tenant_id,omitempty"`
 	ClientID string   `json:"client_id,omitempty"`
 }
 
 // handleUploadToken accepts a token from a remote client and saves it.
-// POST /api/v1/auth/token/{email}
+// POST /api/v1/auth/token/{email}.
 func (s *Server) handleUploadToken(w http.ResponseWriter, r *http.Request) {
 	email := chi.URLParam(r, "email")
 	if email == "" {
@@ -861,7 +866,7 @@ type AddAccountRequest struct {
 }
 
 // handleAddAccount adds an account to the config file.
-// POST /api/v1/accounts
+// POST /api/v1/accounts.
 func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
 	var req AddAccountRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -949,7 +954,7 @@ type queryRequest struct {
 }
 
 // handleQuery executes a raw SQL query against DuckDB views.
-// POST /api/v1/query
+// POST /api/v1/query.
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	querier, ok := s.engine.(query.SQLQuerier)
 	if !ok {
@@ -1161,6 +1166,7 @@ func parseMessageFilter(r *http.Request) query.MessageFilter {
 	filter.RecipientName = r.URL.Query().Get("recipient_name")
 	filter.Domain = r.URL.Query().Get("domain")
 	filter.Label = r.URL.Query().Get("label")
+	filter.MessageType = r.URL.Query().Get("message_type")
 
 	if v := r.URL.Query().Get("time_period"); v != "" {
 		filter.TimeRange.Period = v
@@ -1207,7 +1213,7 @@ func parseMessageFilter(r *http.Request) query.MessageFilter {
 
 	// EmptyValueTargets — comma-separated view type names
 	if v := r.URL.Query().Get("empty_targets"); v != "" {
-		for _, name := range strings.Split(v, ",") {
+		for name := range strings.SplitSeq(v, ",") {
 			if vt, ok := parseViewType(strings.TrimSpace(name)); ok {
 				filter.SetEmptyTarget(vt)
 			}
@@ -1280,18 +1286,53 @@ func toMessageSummaryFromQuery(m query.MessageSummary) MessageSummary {
 	if labels == nil {
 		labels = []string{}
 	}
+	from := m.FromEmail
+	if from == "" && m.FromPhone != "" {
+		from = m.FromPhone
+	}
+	switch {
+	case m.FromName != "" && from != "":
+		from = fmt.Sprintf("%s <%s>", m.FromName, from)
+	case from == "" && m.FromName != "":
+		from = m.FromName
+	}
 	return MessageSummary{
 		ID:             m.ID,
 		ConversationID: m.ConversationID,
 		Subject:        m.Subject,
-		From:           m.FromEmail,
-		To:             []string{}, // Query summary doesn't include recipients
+		MessageType:    m.MessageType,
+		From:           from,
+		To:             formatQueryAddresses(m.To),
+		Cc:             formatQueryAddresses(m.Cc),
+		Bcc:            formatQueryAddresses(m.Bcc),
 		SentAt:         m.SentAt.UTC().Format(time.RFC3339),
 		DeletedAt:      formatDeletedAt(m.DeletedAt),
 		Snippet:        m.Snippet,
 		Labels:         labels,
 		HasAttach:      m.HasAttachments,
 		SizeBytes:      m.SizeEstimate,
+	}
+}
+
+func formatQueryAddresses(addrs []query.Address) []string {
+	if addrs == nil {
+		return []string{}
+	}
+	out := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		out = append(out, formatQueryAddress(addr))
+	}
+	return out
+}
+
+func formatQueryAddress(addr query.Address) string {
+	switch {
+	case addr.Name != "" && addr.Email != "":
+		return fmt.Sprintf("%s <%s>", addr.Name, addr.Email)
+	case addr.Email != "":
+		return addr.Email
+	default:
+		return addr.Name
 	}
 }
 
@@ -1303,7 +1344,7 @@ func formatDeletedAt(deletedAt *time.Time) string {
 }
 
 // handleAggregates returns aggregate data for a view type.
-// GET /api/v1/aggregates?view_type=senders&sort=count&direction=desc&limit=100
+// GET /api/v1/aggregates?view_type=senders&sort=count&direction=desc&limit=100.
 func (s *Server) handleAggregates(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
@@ -1342,7 +1383,7 @@ func (s *Server) handleAggregates(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSubAggregates returns sub-aggregate data after drill-down.
-// GET /api/v1/aggregates/sub?view_type=labels&sender=foo@example.com
+// GET /api/v1/aggregates/sub?view_type=labels&sender=foo@example.com.
 func (s *Server) handleSubAggregates(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
@@ -1383,7 +1424,7 @@ func (s *Server) handleSubAggregates(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleFilteredMessages returns a filtered list of messages.
-// GET /api/v1/messages/filter?sender=foo@example.com&offset=0&limit=500
+// GET /api/v1/messages/filter?sender=foo@example.com&offset=0&limit=500.
 func (s *Server) handleFilteredMessages(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
@@ -1422,7 +1463,7 @@ func (s *Server) handleFilteredMessages(w http.ResponseWriter, r *http.Request) 
 		summaries[i] = toMessageSummaryFromQuery(m)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"count":    len(summaries),
 		"has_more": hasMore,
 		"offset":   filter.Pagination.Offset,
@@ -1432,7 +1473,7 @@ func (s *Server) handleFilteredMessages(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleTotalStats returns detailed stats with optional filters.
-// GET /api/v1/stats/total?source_id=1&attachments_only=true
+// GET /api/v1/stats/total?source_id=1&attachments_only=true.
 func (s *Server) handleTotalStats(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
@@ -1472,7 +1513,7 @@ func (s *Server) handleTotalStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleFastSearch performs fast metadata search (subject, sender, recipient).
-// GET /api/v1/search/fast?q=invoice&offset=0&limit=100
+// GET /api/v1/search/fast?q=invoice&offset=0&limit=100.
 func (s *Server) handleFastSearch(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
@@ -1490,12 +1531,16 @@ func (s *Server) handleFastSearch(w http.ResponseWriter, r *http.Request) {
 	// Reject filter fields that the search engines cannot honor.
 	// SenderName/RecipientName use display names that aren't indexed
 	// for search, ConversationID scoping isn't implemented, and
-	// EmptyValueTargets is an aggregate-only concept.
+	// EmptyValueTargets is an aggregate-only concept. MessageType is
+	// not propagated by MergeFilterIntoQuery — accepting it here would
+	// silently return unscoped results, so reject until the search
+	// pipeline gains a message_type predicate.
 	if filter.SenderName != "" || filter.RecipientName != "" ||
-		filter.ConversationID != nil || filter.HasEmptyTargets() {
+		filter.ConversationID != nil || filter.HasEmptyTargets() ||
+		filter.MessageType != "" {
 		writeError(w, http.StatusBadRequest, "unsupported_filter",
 			"Fast search does not support sender_name, recipient_name, "+
-				"conversation_id, or empty_targets filters")
+				"conversation_id, empty_targets, or message_type filters")
 		return
 	}
 
@@ -1543,7 +1588,7 @@ func (s *Server) handleFastSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDeepSearch performs full-text body search via FTS5.
-// GET /api/v1/search/deep?q=invoice&offset=0&limit=100&source_id=1&hide_deleted=true
+// GET /api/v1/search/deep?q=invoice&offset=0&limit=100&source_id=1&hide_deleted=true.
 func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
@@ -1561,13 +1606,15 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 	// Reject filter fields that MergeFilterIntoQuery cannot represent
 	// in search.Query. Without this check the parameters parse
 	// successfully but silently do nothing, letting deep search
-	// escape the current drill-down scope.
+	// escape the current drill-down scope. MessageType is one of these
+	// silently-dropped fields.
 	if filter.SenderName != "" || filter.RecipientName != "" ||
 		filter.TimeRange.Period != "" || filter.ConversationID != nil ||
-		filter.HasEmptyTargets() {
+		filter.HasEmptyTargets() || filter.MessageType != "" {
 		writeError(w, http.StatusBadRequest, "unsupported_filter",
 			"Deep search does not support sender_name, recipient_name, "+
-				"time_period, conversation_id, or empty_targets filters")
+				"time_period, conversation_id, empty_targets, or "+
+				"message_type filters")
 		return
 	}
 
@@ -1603,7 +1650,7 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 		summaries[i] = toMessageSummaryFromQuery(m)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"query":    queryStr,
 		"messages": summaries,
 		"count":    len(summaries),

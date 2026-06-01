@@ -294,7 +294,7 @@ func detectFormat(threadPath string) (string, bool) {
 	case hasJSON && hasHTML:
 		return "both", true
 	case hasJSON:
-		return "json", true
+		return formatJSON, true
 	case hasHTML:
 		return "html", true
 	}

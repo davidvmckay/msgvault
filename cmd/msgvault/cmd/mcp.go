@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -9,9 +10,9 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	mcpserver "github.com/wesm/msgvault/internal/mcp"
-	"github.com/wesm/msgvault/internal/query"
-	"github.com/wesm/msgvault/internal/store"
+	mcpserver "go.kenn.io/msgvault/internal/mcp"
+	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 var mcpForceSQL bool
@@ -78,13 +79,13 @@ Add to Claude Desktop config:
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: Failed to open Parquet engine: %v\n", err)
 				fmt.Fprintf(os.Stderr, "Falling back to SQLite\n")
-				engine = query.NewSQLiteEngine(s.DB())
+				engine = query.NewEngine(s.DB(), s.IsPostgreSQL())
 			} else {
 				engine = duckEngine
 				defer func() { _ = duckEngine.Close() }()
 			}
 		} else {
-			engine = query.NewSQLiteEngine(s.DB())
+			engine = query.NewEngine(s.DB(), s.IsPostgreSQL())
 		}
 
 		// Derive from cmd.Context() so signal handling installed by
@@ -124,7 +125,7 @@ Add to Claude Desktop config:
 		if mcpHTTPAddr != "" {
 			normalized, err := normalizeMCPHTTPAddr(mcpHTTPAddr, mcpHTTPAllowInsecure)
 			if err != nil {
-				return err
+				return usageErr(cmd, err)
 			}
 			return mcpserver.ServeHTTPWithOptions(ctx, opts, normalized)
 		}
@@ -163,7 +164,7 @@ func init() {
 func normalizeMCPHTTPAddr(addr string, allowInsecure bool) (string, error) {
 	trimmed := strings.TrimSpace(addr)
 	if trimmed == "" {
-		return "", fmt.Errorf("--http requires an address")
+		return "", errors.New("--http requires an address")
 	}
 
 	// Bare port: "8080" or ":8080".

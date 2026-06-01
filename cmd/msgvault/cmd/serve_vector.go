@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/wesm/msgvault/internal/vector/embed"
-	"github.com/wesm/msgvault/internal/vector/hybrid"
-	"github.com/wesm/msgvault/internal/vector/sqlitevec"
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/vector/embed"
+	"go.kenn.io/msgvault/internal/vector/hybrid"
+	"go.kenn.io/msgvault/internal/vector/sqlitevec"
 )
 
 // setupVectorFeatures opens vectors.db and builds the vector backend,
@@ -23,7 +24,17 @@ import (
 // connection.
 func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (*vectorFeatures, error) {
 	if !cfg.Vector.Enabled {
-		return nil, nil
+		return nil, nil //nolint:nilnil // vector disabled: callers nil-check vf; (nil, nil) means "no features, no error"
+	}
+	// The vector backend uses sqlite-vec extension and `ATTACH DATABASE`
+	// to fuse vectors.db onto the main store — both SQLite-only. Refuse
+	// up-front on a PG DSN rather than letting one of the four downstream
+	// callers feed `sql.Open("sqlite3", "postgres://…")` or dispatch raw
+	// ? placeholders against pgx. Vector support for PostgreSQL is
+	// tracked under PR4 (see docs/PG_STATUS.md).
+	if store.IsPostgresURL(mainPath) {
+		return nil, fmt.Errorf(
+			"vector features are SQLite-only; set [vector] enabled = false to use msgvault with PostgreSQL (vector support is planned for PR4)")
 	}
 	if err := cfg.Vector.Validate(); err != nil {
 		return nil, fmt.Errorf("vector config: %w", err)
@@ -61,8 +72,12 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		MainDB:    mainDB,
 		Client:    client,
 		Preprocess: embed.PreprocessConfig{
-			StripQuotes:     cfg.Vector.Preprocess.StripQuotesEnabled(),
-			StripSignatures: cfg.Vector.Preprocess.StripSignaturesEnabled(),
+			StripQuotes:        cfg.Vector.Preprocess.StripQuotesEnabled(),
+			StripSignatures:    cfg.Vector.Preprocess.StripSignaturesEnabled(),
+			StripHTML:          cfg.Vector.Preprocess.StripHTMLEnabled(),
+			StripBase64:        cfg.Vector.Preprocess.StripBase64Enabled(),
+			StripURLTracking:   cfg.Vector.Preprocess.StripURLTrackingEnabled(),
+			CollapseWhitespace: cfg.Vector.Preprocess.CollapseWhitespaceEnabled(),
 		},
 		MaxInputChars:   cfg.Vector.Embeddings.MaxInputChars,
 		BatchSize:       cfg.Vector.Embeddings.BatchSize,
@@ -72,7 +87,7 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 	})
 
 	engine := hybrid.NewEngine(backend, mainDB, client, hybrid.Config{
-		ExpectedFingerprint: cfg.Vector.Embeddings.Fingerprint(),
+		ExpectedFingerprint: cfg.Vector.GenerationFingerprint(),
 		RRFK:                cfg.Vector.Search.RRFK,
 		KPerSignal:          cfg.Vector.Search.KPerSignal,
 		SubjectBoost:        cfg.Vector.Search.SubjectBoost,

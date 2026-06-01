@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/wesm/msgvault/internal/fbmessenger"
-	"github.com/wesm/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/fbmessenger"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 var (
@@ -49,8 +49,7 @@ Examples:
   msgvault import-messenger --me test.user@facebook.messenger --format both ./dyi
   msgvault import-messenger --me test.user@facebook.messenger --limit 100 ./dyi
 `,
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
+	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := MustBeLocal("import-messenger"); err != nil {
 			return err

@@ -6,6 +6,10 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	assertpkg "github.com/stretchr/testify/assert"
+	requirepkg "github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/search"
 )
 
 func TestEscapeLike(t *testing.T) {
@@ -26,10 +30,7 @@ func TestEscapeLike(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := escapeLike(tt.input)
-			if got != tt.want {
-				t.Errorf("escapeLike(%q) = %q, want %q", tt.input, got, tt.want)
-			}
+			assertpkg.Equal(t, tt.want, escapeLike(tt.input), "escapeLike(%q)", tt.input)
 		})
 	}
 }
@@ -39,12 +40,8 @@ func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	st, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	if err := st.InitSchema(); err != nil {
-		t.Fatalf("InitSchema: %v", err)
-	}
+	requirepkg.NoError(t, err, "Open")
+	requirepkg.NoError(t, st.InitSchema(), "InitSchema")
 	t.Cleanup(func() { _ = st.Close() })
 	return st
 }
@@ -62,9 +59,7 @@ func seedMessage(t *testing.T, st *Store, sourceID, convID int64, sourceMessageI
 		Snippet:         sql.NullString{String: snippet, Valid: true},
 		SizeEstimate:    100,
 	})
-	if err != nil {
-		t.Fatalf("UpsertMessage(%q): %v", sourceMessageID, err)
-	}
+	requirepkg.NoError(t, err, "UpsertMessage(%q)", sourceMessageID)
 	return id
 }
 
@@ -154,27 +149,60 @@ func TestParseSQLiteTime(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := parseSQLiteTime(tt.input)
-			if !got.Equal(tt.want) {
-				t.Errorf(
-					"parseSQLiteTime(%q) = %v, want %v",
-					tt.input, got, tt.want,
-				)
-			}
+			assertpkg.True(t, got.Equal(tt.want),
+				"parseSQLiteTime(%q) = %v, want %v", tt.input, got, tt.want)
 		})
 	}
 }
 
+// TestNullableTimestampScan exercises the scanner used by ListMessages
+// /SearchMessages /GetMessages for the COALESCE(sent_at, received_at,
+// internal_date) expression. SQLite's go-sqlite3 driver can return
+// that computed column as string or []byte (no declared datetime
+// affinity); pgx/v5 always delivers time.Time for TIMESTAMP columns.
+// The scanner must accept all of these without erroring.
+func TestNullableTimestampScan(t *testing.T) {
+	tref := time.Date(2024, 6, 15, 10, 30, 45, 0, time.UTC)
+
+	tests := []struct {
+		name      string
+		src       any
+		wantValid bool
+		wantTime  time.Time
+	}{
+		{"nil", nil, false, time.Time{}},
+		{"time.Time", tref, true, tref},
+		{"zero time.Time treated as invalid", time.Time{}, false, time.Time{}},
+		{"string SQLite datetime", "2024-06-15 10:30:45", true, tref},
+		{"string RFC3339", "2024-06-15T10:30:45Z", true, tref},
+		{"[]byte SQLite datetime", []byte("2024-06-15 10:30:45"), true, tref},
+		{"empty string -> invalid", "", false, time.Time{}},
+		{"unparseable string -> invalid", "not-a-date", false, time.Time{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var n nullableTimestamp
+			requirepkg.NoError(t, n.Scan(tt.src), "Scan(%T %v)", tt.src, tt.src)
+			assertpkg.Equal(t, tt.wantValid, n.Valid, "Valid")
+			assertpkg.True(t, n.Time.Equal(tt.wantTime), "Time = %v, want %v", n.Time, tt.wantTime)
+		})
+	}
+
+	t.Run("unsupported type errors", func(t *testing.T) {
+		var n nullableTimestamp
+		requirepkg.Error(t, n.Scan(42), "Scan(int): expected error")
+	})
+}
+
 func TestGetMessageCcBcc(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
 	st := openTestStore(t)
 
 	source, err := st.GetOrCreateSource("gmail", "test@example.com")
-	if err != nil {
-		t.Fatalf("GetOrCreateSource: %v", err)
-	}
+	require.NoError(err, "GetOrCreateSource")
 	convID, err := st.EnsureConversation(source.ID, "thread-1", "Thread")
-	if err != nil {
-		t.Fatalf("EnsureConversation: %v", err)
-	}
+	require.NoError(err, "EnsureConversation")
 	msgID := seedMessage(t, st, source.ID, convID, "msg-cc-bcc", "CC/BCC test", "snippet")
 
 	db := st.DB()
@@ -189,13 +217,12 @@ func TestGetMessageCcBcc(t *testing.T) {
 		{3, "cc2@example.com"},
 		{4, "bcc@example.com"},
 	} {
-		if _, err := db.Exec(
+		_, err := db.Exec(
 			`INSERT INTO participants (id, email_address, domain, created_at, updated_at)
 			 VALUES (?, ?, 'example.com', datetime('now'), datetime('now'))`,
 			p.id, p.email,
-		); err != nil {
-			t.Fatalf("insert participant %s: %v", p.email, err)
-		}
+		)
+		require.NoError(err, "insert participant %s", p.email)
 	}
 
 	// Insert message_recipients
@@ -208,45 +235,36 @@ func TestGetMessageCcBcc(t *testing.T) {
 		{3, "cc"},
 		{4, "bcc"},
 	} {
-		if _, err := db.Exec(
+		_, err := db.Exec(
 			`INSERT INTO message_recipients (message_id, participant_id, recipient_type)
 			 VALUES (?, ?, ?)`,
 			msgID, r.participantID, r.recipientType,
-		); err != nil {
-			t.Fatalf("insert recipient %s: %v", r.recipientType, err)
-		}
+		)
+		require.NoError(err, "insert recipient %s", r.recipientType)
 	}
 
 	// Test GetMessage
 	m, err := st.GetMessage(msgID)
-	if err != nil {
-		t.Fatalf("GetMessage: %v", err)
-	}
-	if len(m.To) != 1 || m.To[0] != "to@example.com" {
-		t.Errorf("To = %v, want [to@example.com]", m.To)
-	}
+	require.NoError(err, "GetMessage")
+	require.Len(m.To, 1)
+	assert.Equal("to@example.com", m.To[0], "To[0]")
 	gotCc := slices.Clone(m.Cc)
 	slices.Sort(gotCc)
 	wantCc := []string{"cc1@example.com", "cc2@example.com"}
-	if !slices.Equal(gotCc, wantCc) {
-		t.Errorf("Cc = %v, want %v", m.Cc, wantCc)
-	}
-	if len(m.Bcc) != 1 || m.Bcc[0] != "bcc@example.com" {
-		t.Errorf("Bcc = %v, want [bcc@example.com]", m.Bcc)
-	}
+	assert.True(slices.Equal(gotCc, wantCc), "Cc = %v, want %v", m.Cc, wantCc)
+	require.Len(m.Bcc, 1)
+	assert.Equal("bcc@example.com", m.Bcc[0], "Bcc[0]")
 }
 
 func TestListMessagesCcBcc(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
 	st := openTestStore(t)
 
 	source, err := st.GetOrCreateSource("gmail", "test@example.com")
-	if err != nil {
-		t.Fatalf("GetOrCreateSource: %v", err)
-	}
+	require.NoError(err, "GetOrCreateSource")
 	convID, err := st.EnsureConversation(source.ID, "thread-1", "Thread")
-	if err != nil {
-		t.Fatalf("EnsureConversation: %v", err)
-	}
+	require.NoError(err, "EnsureConversation")
 	msgID := seedMessage(t, st, source.ID, convID, "msg-list-cc", "List CC test", "snippet")
 
 	db := st.DB()
@@ -259,13 +277,12 @@ func TestListMessagesCcBcc(t *testing.T) {
 		{10, "cc@example.com"},
 		{11, "bcc@example.com"},
 	} {
-		if _, err := db.Exec(
+		_, err := db.Exec(
 			`INSERT INTO participants (id, email_address, domain, created_at, updated_at)
 			 VALUES (?, ?, 'example.com', datetime('now'), datetime('now'))`,
 			p.id, p.email,
-		); err != nil {
-			t.Fatalf("insert participant %s: %v", p.email, err)
-		}
+		)
+		require.NoError(err, "insert participant %s", p.email)
 	}
 	for _, r := range []struct {
 		participantID int
@@ -274,27 +291,151 @@ func TestListMessagesCcBcc(t *testing.T) {
 		{10, "cc"},
 		{11, "bcc"},
 	} {
-		if _, err := db.Exec(
+		_, err := db.Exec(
 			`INSERT INTO message_recipients (message_id, participant_id, recipient_type)
 			 VALUES (?, ?, ?)`, msgID, r.participantID, r.recipientType,
-		); err != nil {
-			t.Fatalf("insert recipient %s: %v", r.recipientType, err)
-		}
+		)
+		require.NoError(err, "insert recipient %s", r.recipientType)
 	}
 
 	messages, total, err := st.ListMessages(0, 100)
-	if err != nil {
-		t.Fatalf("ListMessages: %v", err)
+	require.NoError(err, "ListMessages")
+	require.Equal(int64(1), total, "total")
+	require.Len(messages[0].Cc, 1)
+	assert.Equal("cc@example.com", messages[0].Cc[0], "Cc[0]")
+	require.Len(messages[0].Bcc, 1)
+	assert.Equal("bcc@example.com", messages[0].Bcc[0], "Bcc[0]")
+}
+
+// TestListAndSearchSurfacePhoneAndIdentifierParticipants exercises the
+// store-backed list/search path for SMS-style participants that have no
+// email_address: phone-only (synctech-sms phone backups) and identifier-
+// only with a contact name (synctech-sms short codes routed through
+// EnsureParticipantByIdentifier). Before the participantDisplaySQL fix
+// these rendered with blank From/To because the SELECT only read
+// p.email_address.
+func TestListAndSearchSurfacePhoneAndIdentifierParticipants(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	st := openTestStore(t)
+
+	source, err := st.GetOrCreateSource("synctech-sms", "+15550000001")
+	require.NoError(err, "GetOrCreateSource")
+	convID, err := st.EnsureConversation(source.ID, "text:1,2", "Alice")
+	require.NoError(err, "EnsureConversation")
+
+	phoneSenderID, err := st.EnsureParticipantByPhone("+15551234567", "Alice", "synctech-sms")
+	require.NoError(err, "EnsureParticipantByPhone")
+	ownerID, err := st.EnsureParticipantByPhone("+15550000001", "Me", "synctech-sms")
+	require.NoError(err, "EnsureParticipantByPhone(owner)")
+	shortCodeID, err := st.EnsureParticipantByIdentifier("synctech-sms", "22000", "ShortCode Alerts")
+	require.NoError(err, "EnsureParticipantByIdentifier")
+
+	// Phone-backed sender, phone-backed recipient.
+	smsID, err := st.UpsertMessage(&Message{
+		ConversationID:  convID,
+		SourceID:        source.ID,
+		SourceMessageID: "sms-phone",
+		MessageType:     "sms",
+		Subject:         sql.NullString{String: "hello", Valid: true},
+		Snippet:         sql.NullString{String: "hello from sms", Valid: true},
+		SenderID:        sql.NullInt64{Int64: phoneSenderID, Valid: true},
+		SizeEstimate:    14,
+	})
+	require.NoError(err, "UpsertMessage(sms-phone)")
+	require.NoError(st.ReplaceMessageRecipients(smsID, "from", []int64{phoneSenderID}, []string{""}),
+		"ReplaceMessageRecipients(from)")
+	require.NoError(st.ReplaceMessageRecipients(smsID, "to", []int64{ownerID}, []string{""}),
+		"ReplaceMessageRecipients(to)")
+	require.NoError(st.UpsertFTS(smsID, "hello", "hello from sms", "", "", ""),
+		"UpsertFTS(sms-phone)")
+
+	// Short-code sender with a contact name but no email/phone.
+	shortID, err := st.UpsertMessage(&Message{
+		ConversationID:  convID,
+		SourceID:        source.ID,
+		SourceMessageID: "sms-shortcode",
+		MessageType:     "sms",
+		Subject:         sql.NullString{String: "code", Valid: true},
+		Snippet:         sql.NullString{String: "your code is 123456", Valid: true},
+		SenderID:        sql.NullInt64{Int64: shortCodeID, Valid: true},
+		SizeEstimate:    20,
+	})
+	require.NoError(err, "UpsertMessage(sms-shortcode)")
+	require.NoError(st.ReplaceMessageRecipients(shortID, "from", []int64{shortCodeID}, []string{""}),
+		"ReplaceMessageRecipients(short-from)")
+	require.NoError(st.UpsertFTS(shortID, "code", "your code is 123456", "", "", ""),
+		"UpsertFTS(sms-shortcode)")
+
+	// WhatsApp-style sender: messages.sender_id is set but no 'from'
+	// row exists in message_recipients. The store-backed SELECT used
+	// to join participants only through mr.participant_id, so this
+	// message rendered with a blank From.
+	waSenderID, err := st.EnsureParticipantByPhone("+15559998888", "Carol", "whatsapp")
+	require.NoError(err, "EnsureParticipantByPhone(whatsapp)")
+	waID, err := st.UpsertMessage(&Message{
+		ConversationID:  convID,
+		SourceID:        source.ID,
+		SourceMessageID: "wa-sender-only",
+		MessageType:     "whatsapp",
+		Subject:         sql.NullString{String: "wa", Valid: true},
+		Snippet:         sql.NullString{String: "wa snippet", Valid: true},
+		SenderID:        sql.NullInt64{Int64: waSenderID, Valid: true},
+		SizeEstimate:    10,
+	})
+	require.NoError(err, "UpsertMessage(wa-sender-only)")
+	require.NoError(st.UpsertFTS(waID, "wa", "wa snippet", "", "", ""),
+		"UpsertFTS(wa-sender-only)")
+
+	want := map[string]struct {
+		from string
+		to   []string
+	}{
+		"sms-phone":      {from: "Alice <+15551234567>", to: []string{"Me <+15550000001>"}},
+		"sms-shortcode":  {from: "ShortCode Alerts", to: nil},
+		"wa-sender-only": {from: "Carol <+15559998888>", to: nil},
 	}
-	if total != 1 {
-		t.Fatalf("total = %d, want 1", total)
+
+	// ListMessages and SearchMessages take different code paths but
+	// share the same scanner/recipient loader.
+	msgs, _, err := st.ListMessages(0, 100)
+	require.NoError(err, "ListMessages")
+	gotByID := make(map[string]APIMessage, len(msgs))
+	for _, m := range msgs {
+		row, err := st.GetMessage(m.ID)
+		require.NoError(err, "GetMessage(%d)", m.ID)
+		// Detail call populates To from getRecipients; pull both for
+		// per-key assertions.
+		m.To = row.To
+		gotByID[sourceMessageIDForTest(t, st, m.ID)] = m
 	}
-	if len(messages[0].Cc) != 1 || messages[0].Cc[0] != "cc@example.com" {
-		t.Errorf("Cc = %v, want [cc@example.com]", messages[0].Cc)
+	for srcMsgID, w := range want {
+		got, ok := gotByID[srcMsgID]
+		require.True(ok, "ListMessages missing %s", srcMsgID)
+		assert.Equal(w.from, got.From, "%s ListMessages From", srcMsgID)
+		if len(w.to) == 0 {
+			assert.Empty(got.To, "%s ListMessages To", srcMsgID)
+		} else {
+			require.Len(got.To, len(w.to), "%s ListMessages To", srcMsgID)
+			assert.Equal(w.to[0], got.To[0], "%s ListMessages To[0]", srcMsgID)
+		}
 	}
-	if len(messages[0].Bcc) != 1 || messages[0].Bcc[0] != "bcc@example.com" {
-		t.Errorf("Bcc = %v, want [bcc@example.com]", messages[0].Bcc)
-	}
+
+	// SearchMessagesLike covers the FTS-disabled search code path used
+	// when the FTS index errors at runtime. It composes the same SELECT
+	// columns, so the no-FTS path must surface phone/name too.
+	results, _, err := st.SearchMessagesQuery(&search.Query{TextTerms: []string{"123456"}}, 0, 100)
+	require.NoError(err, "SearchMessagesQuery")
+	require.Len(results, 1, "SearchMessagesQuery results")
+	assert.Equal(want["sms-shortcode"].from, results[0].From, "SearchMessagesQuery From")
+}
+
+func sourceMessageIDForTest(t *testing.T, st *Store, id int64) string {
+	t.Helper()
+	var sourceMsgID string
+	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`SELECT source_message_id FROM messages WHERE id = ?`), id).Scan(&sourceMsgID),
+		"lookup source_message_id")
+	return sourceMsgID
 }
 
 func TestSearchMessagesLikeLiteralWildcards(t *testing.T) {
@@ -302,13 +443,9 @@ func TestSearchMessagesLikeLiteralWildcards(t *testing.T) {
 
 	// Create a source and conversation
 	source, err := st.GetOrCreateSource("gmail", "test@example.com")
-	if err != nil {
-		t.Fatalf("GetOrCreateSource: %v", err)
-	}
+	requirepkg.NoError(t, err, "GetOrCreateSource")
 	convID, err := st.EnsureConversation(source.ID, "thread-1", "Thread")
-	if err != nil {
-		t.Fatalf("EnsureConversation: %v", err)
-	}
+	requirepkg.NoError(t, err, "EnsureConversation")
 
 	// Seed messages: one with literal %, one with literal _, one plain,
 	// plus confounding rows that would match if wildcards weren't escaped.
@@ -353,15 +490,9 @@ func TestSearchMessagesLikeLiteralWildcards(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			messages, total, err := st.searchMessagesLike(tt.query, 0, 100)
-			if err != nil {
-				t.Fatalf("searchMessagesLike(%q): %v", tt.query, err)
-			}
-			if total != tt.wantCount {
-				t.Errorf("total = %d, want %d", total, tt.wantCount)
-			}
-			if len(messages) != tt.wantLen {
-				t.Errorf("len(messages) = %d, want %d", len(messages), tt.wantLen)
-			}
+			requirepkg.NoError(t, err, "searchMessagesLike(%q)", tt.query)
+			assertpkg.Equal(t, tt.wantCount, total, "total")
+			assertpkg.Len(t, messages, tt.wantLen, "len(messages)")
 		})
 	}
 }

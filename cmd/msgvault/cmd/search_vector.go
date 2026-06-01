@@ -15,11 +15,11 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/spf13/cobra"
-	"github.com/wesm/msgvault/internal/search"
-	"github.com/wesm/msgvault/internal/vector"
-	"github.com/wesm/msgvault/internal/vector/embed"
-	"github.com/wesm/msgvault/internal/vector/hybrid"
-	"github.com/wesm/msgvault/internal/vector/sqlitevec"
+	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/vector"
+	"go.kenn.io/msgvault/internal/vector/embed"
+	"go.kenn.io/msgvault/internal/vector/hybrid"
+	"go.kenn.io/msgvault/internal/vector/sqlitevec"
 )
 
 // runHybridSearch executes a vector or hybrid search against the local
@@ -66,7 +66,7 @@ func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool, sc
 	}
 	defer func() { _ = backend.Close() }()
 
-	active, err := vector.ResolveActive(ctx, backend, cfg.Vector.Embeddings)
+	active, err := vector.ResolveActiveForFingerprint(ctx, backend, cfg.Vector.GenerationFingerprint())
 	if err != nil {
 		return fmt.Errorf("resolve active generation: %w", err)
 	}
@@ -81,7 +81,7 @@ func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool, sc
 	})
 
 	eng := hybrid.NewEngine(backend, mainDB, embedClient, hybrid.Config{
-		ExpectedFingerprint: cfg.Vector.Embeddings.Fingerprint(),
+		ExpectedFingerprint: cfg.Vector.GenerationFingerprint(),
 		RRFK:                cfg.Vector.Search.RRFK,
 		KPerSignal:          cfg.Vector.Search.KPerSignal,
 		SubjectBoost:        cfg.Vector.Search.SubjectBoost,

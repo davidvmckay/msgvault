@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/wesm/msgvault/internal/gmail"
-	"github.com/wesm/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 // Incremental performs an incremental sync using the Gmail History API.
@@ -20,7 +20,7 @@ import (
 // identifier (e.g. a Gmail and IMAP source for the same email address).
 func (s *Syncer) Incremental(ctx context.Context, source *store.Source) (summary *gmail.SyncSummary, err error) {
 	if source == nil {
-		return nil, fmt.Errorf("no source provided - run full sync first")
+		return nil, errors.New("no source provided - run full sync first")
 	}
 
 	startTime := time.Now()
@@ -165,7 +165,7 @@ func (s *Syncer) Incremental(ctx context.Context, source *store.Source) (summary
 						continue
 					}
 					threadID := newMsgThreads[newMsgIDs[i]]
-					insertedID, err := s.ingestMessage(ctx, source.ID, raw, threadID, labelMap)
+					insertedID, err := s.ingestMessage(source.ID, raw, threadID, labelMap)
 					if err != nil {
 						s.logger.Warn("failed to ingest added message", "id", newMsgIDs[i], "error", err)
 						checkpoint.ErrorsCount++
@@ -281,7 +281,7 @@ func (s *Syncer) handleLabelChange(ctx context.Context, sourceID int64, messageI
 			if err != nil {
 				return false, err
 			}
-			insertedID, err := s.ingestMessage(ctx, sourceID, raw, threadID, labelMap)
+			insertedID, err := s.ingestMessage(sourceID, raw, threadID, labelMap)
 			if err != nil {
 				return false, err
 			}

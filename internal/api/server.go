@@ -13,13 +13,13 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
-	"github.com/wesm/msgvault/internal/config"
-	"github.com/wesm/msgvault/internal/query"
-	"github.com/wesm/msgvault/internal/scheduler"
-	"github.com/wesm/msgvault/internal/search"
-	"github.com/wesm/msgvault/internal/store"
-	"github.com/wesm/msgvault/internal/vector"
-	"github.com/wesm/msgvault/internal/vector/hybrid"
+	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/scheduler"
+	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/vector"
+	"go.kenn.io/msgvault/internal/vector/hybrid"
 )
 
 // MessageStore defines the store operations the API needs.
@@ -280,7 +280,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
 			// Also check X-API-Key header
-			authHeader = r.Header.Get("X-API-Key")
+			authHeader = r.Header.Get("X-Api-Key")
 		}
 
 		// Strip "Bearer " prefix if present

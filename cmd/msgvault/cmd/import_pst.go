@@ -8,8 +8,8 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
-	"github.com/wesm/msgvault/internal/importer"
-	"github.com/wesm/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/importer"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 var (
@@ -38,8 +38,7 @@ Examples:
   msgvault import-pst you@outlook.com backup.pst --skip-folder "Deleted Items"
   msgvault import-pst you@outlook.com backup.pst --no-resume
 `,
-	Args:         cobra.ExactArgs(2),
-	SilenceUsage: true,
+	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		identifier := args[0]
 		pstPath := args[1]

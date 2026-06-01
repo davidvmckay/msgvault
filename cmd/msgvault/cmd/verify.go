@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -11,10 +12,10 @@ import (
 
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
-	"github.com/wesm/msgvault/internal/gmail"
-	"github.com/wesm/msgvault/internal/mime"
-	"github.com/wesm/msgvault/internal/oauth"
-	"github.com/wesm/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/oauth"
+	"go.kenn.io/msgvault/internal/store"
 	"golang.org/x/oauth2"
 )
 
@@ -30,7 +31,9 @@ var verifyCmd = &cobra.Command{
 and sampling messages to ensure raw MIME data is intact.
 
 This command:
-1. Runs SQLite integrity checks on the database (unless --skip-db-check)
+1. On SQLite: runs PRAGMA integrity_check on the database (unless --skip-db-check).
+   On PostgreSQL: prints a notice that the in-engine check is skipped — use
+   pg_amcheck out-of-band to validate the cluster.
 2. Compares local message count with Gmail's reported total
 3. Checks how many messages have raw MIME data stored
 4. Samples random messages and verifies their MIME can be decompressed
@@ -60,35 +63,43 @@ Examples:
 
 		// Run SQLite integrity check before any Gmail work. Users with a
 		// corrupt database should see the repair hint even if their OAuth
-		// token is expired or the network is down.
+		// token is expired or the network is down. PostgreSQL has no
+		// in-engine integrity_check; print a notice so users know the
+		// check was skipped intentionally and point them at the right
+		// out-of-band tool.
 		var dbCorrupt bool
 		if !verifySkipDBCheck {
-			fmt.Println("Running database integrity check...")
-			integrityErrors, err := runIntegrityCheck(s)
-			if err != nil {
-				return fmt.Errorf("integrity check failed: %w", err)
-			}
-			if len(integrityErrors) == 0 {
-				fmt.Println("  Database integrity: OK")
+			if s.IsPostgreSQL() {
+				fmt.Println("Skipping database integrity check (PostgreSQL — use pg_amcheck out-of-band).")
+				fmt.Println()
 			} else {
-				dbCorrupt = true
-				fmt.Printf("  Database integrity: FAILED (%d errors)\n", len(integrityErrors))
-				for i, ie := range integrityErrors {
-					if i >= 10 {
-						fmt.Printf("  ... and %d more errors\n", len(integrityErrors)-10)
-						break
-					}
-					fmt.Printf("  - %s\n", ie)
+				fmt.Println("Running database integrity check...")
+				integrityErrors, err := runIntegrityCheck(s)
+				if err != nil {
+					return fmt.Errorf("integrity check failed: %w", err)
 				}
-				printIntegrityRecoveryHint(integrityErrors)
+				if len(integrityErrors) == 0 {
+					fmt.Println("  Database integrity: OK")
+				} else {
+					dbCorrupt = true
+					fmt.Printf("  Database integrity: FAILED (%d errors)\n", len(integrityErrors))
+					for i, ie := range integrityErrors {
+						if i >= 10 {
+							fmt.Printf("  ... and %d more errors\n", len(integrityErrors)-10)
+							break
+						}
+						fmt.Printf("  - %s\n", ie)
+					}
+					printIntegrityRecoveryHint(integrityErrors)
+				}
+				fmt.Println()
 			}
-			fmt.Println()
 		}
 
 		// Look up source to get OAuth app binding
 		appName := ""
 		src, srcErr := findGmailSource(s, email)
-		if srcErr != nil {
+		if srcErr != nil && !errors.Is(srcErr, errGmailSourceNotFound) {
 			return fmt.Errorf("look up source for %s: %w", email, srcErr)
 		}
 		if src != nil {
@@ -160,14 +171,14 @@ Examples:
 		// specifically since the same identifier may exist for
 		// other source types (mbox, imap).
 		source, err := findGmailSource(s, email)
-		if err != nil {
+		if err != nil && !errors.Is(err, errGmailSourceNotFound) {
 			return fmt.Errorf("get source: %w", err)
 		}
 		if source == nil {
 			fmt.Printf("Gmail account %s not found in database.\n", email)
 			fmt.Println("Run 'sync-full' first to populate the archive.")
 			if dbCorrupt {
-				return fmt.Errorf("database integrity check failed")
+				return errors.New("database integrity check failed")
 			}
 			return nil
 		}
@@ -219,7 +230,7 @@ Examples:
 			fmt.Printf("Sampling %d messages...\n", len(sampleIDs))
 
 			verified := 0
-			var errors []string
+			var sampleErrs []string
 
 			for _, msgID := range sampleIDs {
 				// Check context cancellation
@@ -231,10 +242,10 @@ Examples:
 				// Get raw MIME
 				rawData, err := s.GetMessageRaw(msgID)
 				if err != nil {
-					if err == sql.ErrNoRows {
-						errors = append(errors, fmt.Sprintf("msg %d: missing raw MIME", msgID))
+					if errors.Is(err, sql.ErrNoRows) {
+						sampleErrs = append(sampleErrs, fmt.Sprintf("msg %d: missing raw MIME", msgID))
 					} else {
-						errors = append(errors, fmt.Sprintf("msg %d: db error (%v)", msgID, err))
+						sampleErrs = append(sampleErrs, fmt.Sprintf("msg %d: db error (%v)", msgID, err))
 					}
 					continue
 				}
@@ -242,19 +253,19 @@ Examples:
 				// Verify it can be parsed as MIME
 				_, err = mime.Parse(rawData)
 				if err != nil {
-					errors = append(errors, fmt.Sprintf("msg %d: corrupt MIME (%v)", msgID, err))
+					sampleErrs = append(sampleErrs, fmt.Sprintf("msg %d: corrupt MIME (%v)", msgID, err))
 					continue
 				}
 
 				verified++
 			}
 
-			if len(errors) > 0 {
+			if len(sampleErrs) > 0 {
 				fmt.Printf("Sample verified:     %10d of %d\n", verified, len(sampleIDs))
-				fmt.Printf("Sample errors:       %10d\n", len(errors))
-				for i, err := range errors {
+				fmt.Printf("Sample errors:       %10d\n", len(sampleErrs))
+				for i, err := range sampleErrs {
 					if i >= 5 {
-						fmt.Printf("  ... and %d more\n", len(errors)-5)
+						fmt.Printf("  ... and %d more\n", len(sampleErrs)-5)
 						break
 					}
 					fmt.Printf("  - %s\n", err)
@@ -268,7 +279,7 @@ Examples:
 		fmt.Println("Verification complete.")
 
 		if dbCorrupt {
-			return fmt.Errorf("database integrity check failed")
+			return errors.New("database integrity check failed")
 		}
 
 		return nil
@@ -277,24 +288,33 @@ Examples:
 
 // runIntegrityCheck runs PRAGMA integrity_check on the database and returns
 // any error strings. An empty slice means the database is healthy.
+//
+// PostgreSQL has no in-engine analogue; its corruption checks live in
+// external admin tooling (pg_amcheck, pg_dump --section=data) that
+// require server-side privileges this CLI does not assume. On PG we
+// return no errors so the rest of `verify` (Gmail message round-trip)
+// still runs — the user is expected to monitor PG health separately.
 func runIntegrityCheck(s *store.Store) ([]string, error) {
+	if s.IsPostgreSQL() {
+		return nil, nil
+	}
 	rows, err := s.DB().Query("PRAGMA integrity_check(100)")
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 
-	var errors []string
+	var integErrs []string
 	for rows.Next() {
 		var result string
 		if err := rows.Scan(&result); err != nil {
 			return nil, err
 		}
 		if result != "ok" {
-			errors = append(errors, result)
+			integErrs = append(integErrs, result)
 		}
 	}
-	return errors, rows.Err()
+	return integErrs, rows.Err()
 }
 
 // printIntegrityRecoveryHint prints repair guidance tailored to the kind of

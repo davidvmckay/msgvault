@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,8 +15,8 @@ import (
 	"time"
 
 	pstlib "github.com/mooijtech/go-pst/v6/pkg"
-	pstreader "github.com/wesm/msgvault/internal/pst"
-	"github.com/wesm/msgvault/internal/store"
+	pstreader "go.kenn.io/msgvault/internal/pst"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 // PstImportOptions configures a PST import operation.
@@ -73,9 +75,15 @@ type PstImportSummary struct {
 	HardErrors        bool
 }
 
-// pstCheckpoint tracks resume state for PST imports.
+// pstCheckpoint tracks resume state for PST imports. ArchiveID is the
+// content-based fingerprint from pstArchiveFingerprint and is the
+// authoritative identity check during resume — path/inode comparisons
+// can match a replaced file (same path, same inode after copy-over)
+// whose bytes have changed, which would silently skip messages at the
+// resumed offset.
 type pstCheckpoint struct {
 	File        string `json:"file"`
+	ArchiveID   string `json:"archive_id,omitempty"`
 	FolderIndex int    `json:"folder_index"`
 	FolderPath  string `json:"folder_path"`
 	MsgIndex    int64  `json:"msg_index"`
@@ -93,7 +101,7 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 		opts.SourceType = "pst"
 	}
 	if opts.Identifier == "" {
-		return nil, fmt.Errorf("identifier is required")
+		return nil, errors.New("identifier is required")
 	}
 	if opts.CheckpointInterval <= 0 {
 		opts.CheckpointInterval = 200
@@ -122,6 +130,16 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 	cpFile := absPath
 	if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
 		cpFile = resolved
+	}
+
+	// Per-archive fingerprint namespaces source_message_id so importing
+	// multiple PST files into the same source can't collide on EntryIDs
+	// (PST EntryIDs are only unique within a single archive). Derived from
+	// the PST header bytes so the fingerprint is stable across re-imports of
+	// the same file regardless of path, preserving idempotence.
+	archiveID, err := pstArchiveFingerprint(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("fingerprint pst: %w", err)
 	}
 
 	// Build skip-folder set (case-insensitive).
@@ -156,7 +174,7 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 
 	if !opts.NoResume {
 		active, err := st.GetActiveSync(src.ID)
-		if err != nil {
+		if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
 			return nil, fmt.Errorf("check active sync: %w", err)
 		}
 		if active != nil {
@@ -176,7 +194,26 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 							}
 						}
 					}
-					if sameFile {
+					// If the checkpoint records an ArchiveID and it
+					// differs from the current file's fingerprint, the
+					// PST at this path has been replaced (e.g.,
+					// re-exported from the mail client). Path/inode
+					// equality is not sufficient — a copy-over can keep
+					// the same path and inode while the byte content
+					// changes, which would otherwise resume at an offset
+					// that points into different messages and silently
+					// skip everything before it. Treat as a user-
+					// initiated restart: drop the offsets, log loudly,
+					// and re-import from the beginning.
+					archiveChanged := saved.ArchiveID != "" && saved.ArchiveID != archiveID
+					if sameFile && archiveChanged {
+						log.Warn("pst archive fingerprint changed since last checkpoint; restarting from the beginning",
+							"file", absPath,
+							"saved_archive_id", saved.ArchiveID,
+							"current_archive_id", archiveID,
+						)
+						summary.WasResumed = false
+					} else if sameFile {
 						resume = saved
 						summary.WasResumed = true
 						log.Info("resuming pst import",
@@ -207,7 +244,7 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 
 	// Save initial checkpoint only for new syncs; resuming preserves the existing cursor.
 	if !summary.WasResumed {
-		if err := savePstCheckpoint(st, syncID, cpFile, 0, "", 0, &cp); err != nil {
+		if err := savePstCheckpoint(st, syncID, cpFile, archiveID, 0, "", 0, &cp); err != nil {
 			log.Warn("failed to save initial checkpoint", "error", err)
 		}
 	}
@@ -291,7 +328,7 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 	)
 
 	saveCp := func(fi int, fp string, mi int64) {
-		if err := savePstCheckpoint(st, syncID, cpFile, fi, fp, mi, &cp); err != nil {
+		if err := savePstCheckpoint(st, syncID, cpFile, archiveID, fi, fp, mi, &cp); err != nil {
 			cp.ErrorsCount++
 			summary.Errors++
 			log.Warn("failed to save checkpoint", "error", err)
@@ -498,12 +535,12 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 
 			sum := sha256.Sum256(raw)
 			rawHash := hex.EncodeToString(sum[:])
-			// Use the PST entry ID as the stable dedup key so that re-importing
-			// the same PST file always skips already-imported messages, even when
-			// the MIME reconstruction produces different bytes (e.g. random
-			// multipart boundaries). rawHash is still passed to IngestRawMessage
-			// as a fallback for thread ID generation.
-			sourceMsgID := "pst-" + entry.EntryID
+			// PST EntryIDs are unique only within a single PST file, so a bare
+			// "pst-<EntryID>" key would collide across archives sharing one
+			// source. Prefix with the archive fingerprint to keep dedup
+			// idempotent for re-imports of the same file while isolating
+			// different files imported under the same identifier.
+			sourceMsgID := fmt.Sprintf("pst-%s-%s", archiveID, entry.EntryID)
 
 			fallbackDate := entry.SentAt
 			if fallbackDate.IsZero() {
@@ -564,9 +601,33 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 	return summary, nil
 }
 
-func savePstCheckpoint(st *store.Store, syncID int64, file string, folderIndex int, folderPath string, msgIndex int64, cp *store.Checkpoint) error {
+// pstArchiveFingerprint returns a short stable identifier for a PST file,
+// derived from a SHA-256 over its first 4 KiB. The PST header in that range
+// embeds counters (next BID, next NID, root NIDs) that differ across files
+// even when generated from the same template, so the prefix uniquely
+// distinguishes archives. Re-importing the same bytes yields the same
+// fingerprint regardless of path, preserving idempotence.
+func pstArchiveFingerprint(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+
+	var buf [4096]byte
+	n, err := io.ReadFull(f, buf[:])
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+
+	sum := sha256.Sum256(buf[:n])
+	return hex.EncodeToString(sum[:6]), nil
+}
+
+func savePstCheckpoint(st *store.Store, syncID int64, file, archiveID string, folderIndex int, folderPath string, msgIndex int64, cp *store.Checkpoint) error {
 	b, err := json.Marshal(pstCheckpoint{
 		File:        file,
+		ArchiveID:   archiveID,
 		FolderIndex: folderIndex,
 		FolderPath:  folderPath,
 		MsgIndex:    msgIndex,
